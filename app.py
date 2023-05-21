@@ -7,7 +7,9 @@ from flask_cors import CORS
 import numpy as np
 import rasterio as rio
 from scipy.interpolate import griddata
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
+import time as t
 
 app = Flask(__name__)
 CORS(app)
@@ -99,75 +101,73 @@ def interpolate_weather_data(param, time, coords):
             AND longitude < {upperLng}
             AND time_start = {time};
     """
+    start_time = t.time()
     cursor.execute(query)
     results = cursor.fetchall()
-    temperatureData = results  # Placeholder for temperature data
+    data = results
+    end_time = t.time()
+    execution_time = end_time - start_time
+
+    print(f"time to fetch data: {execution_time} seconds")
 
     width = 700  # Width of the 2D array
     height = 400  # Height of the 2D array
     arr = np.full((height, width), np.nan)
 
-    minTemperature = min(data['t'] for data in temperatureData)
-    maxTemperature = max(data['t'] for data in temperatureData)
-
-    for data in temperatureData:
+    for data in data:
         x = int((float(data['longitude']) - lowerLng) * (width / (upperLng - lowerLng)))
         y = int((upperLat - float(data['latitude'])) * (height / (upperLat - lowerLat)))
         arr[y][x] = float(data['t'])
     
-    arr = fill_nans_bilinear(arr)
+    start_time = t.time()
+    arr = interpolate(arr)
+    end_time = t.time()
+    execution_time = end_time - start_time
 
-    # Create a blank PIL image using mode='RGB'
+    print(f"time to interpolate: {execution_time} seconds")
+
     height, width = arr.shape
     image = Image.new('RGB', (width, height))
 
-    # Iterate over each pixel in the array
+    start_time = t.time()
+
+    pixel_values = arr.flatten()
+    color_scale_values = color_scale[:, 0]
+    color_scale_rgb = color_scale[:, 1:]
+    indices = np.interp(pixel_values, color_scale_values, np.arange(len(color_scale)))
+
     for y in range(height):
         for x in range(width):
-            pixel_value = arr[y, x]
-
-            # Check if the pixel value is NaN
+            pixel_value = pixel_values[y * width + x]
             if not np.isnan(pixel_value):
-                # Find the nearest index in the color scale based on the pixel value
-                index = np.interp(pixel_value, color_scale[:, 0], np.arange(len(color_scale)))
-                # Get the neighboring indices for interpolation
+                index = indices[y * width + x]
                 lower_index = int(np.floor(index))
                 upper_index = int(np.ceil(index))
-
-                # Get the RGB values for the lower and upper indices
-                lower_rgb = color_scale[lower_index, 1:]
-                upper_rgb = color_scale[upper_index, 1:]
-
-                # Calculate the interpolation factor
+                lower_rgb = color_scale_rgb[lower_index]
+                upper_rgb = color_scale_rgb[upper_index]
                 factor = index - lower_index
-
-                # Interpolate the RGB values
                 interpolated_rgb = (1 - factor) * lower_rgb + factor * upper_rgb
-
-                # Set the color of the pixel in the image
-                r, g, b = tuple(interpolated_rgb.clip(0, 255).astype(int))
+                r, g, b = tuple(interpolated_rgb.astype(int))
                 image.putpixel((x, y), (r, g, b))
             else:
                 image.putpixel((x, y), (0, 0, 0))
-    # Create an in-memory stream
+                
+    end_time = t.time()
+    execution_time = end_time - start_time
+
+    print(f"time to color png: {execution_time} seconds")
+
     img_stream = BytesIO()
-
-    # Save the PIL image to the stream as PNG
     image.save(img_stream, format='PNG')
-
-    # Set the stream position to the beginning
     img_stream.seek(0)
-
-    # Return the image as a response
     return send_file(img_stream, mimetype='image/png')
 
-
-def fill_nans_bilinear(array):
+def interpolate(array):
     x, y = np.meshgrid(np.arange(array.shape[1]), np.arange(array.shape[0]))
     points = np.column_stack((x.flatten(), y.flatten()))
     values = array.flatten()
     valid_indices = ~np.isnan(values)
-    filled_values = griddata(points[valid_indices], values[valid_indices], (x, y), method='cubic')
+    filled_values = griddata(points[valid_indices], values[valid_indices], (x, y), method='linear')
     return filled_values
 
 if __name__ == '__main__':
