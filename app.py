@@ -10,6 +10,7 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.transform import from_bounds
 from rasterio.windows import Window
+from rasterio.warp import reproject, Resampling
 from rasterio.warp import calculate_default_transform
 from rasterio.io import MemoryFile
 from scipy.interpolate import griddata
@@ -79,18 +80,30 @@ def get_min_max(time, param):
     results = cursor.fetchall()
     return jsonify(results)
 
-color_scale = np.array([[-23.33333333, 255., 180., 255.],
-                  [-16.66666667, 255., 0., 255.],
-                  [-10., 180., 0., 255.],
-                  [-5.33333333, 100., 0., 255.],
-                  [0., 0., 0., 255.],
-                  [4.66666667, 0., 255., 255.],
-                  [10., 255., 255., 255.],
-                  [16.66666667, 255., 255., 0.],
-                  [23.33333333, 255., 180., 0.],
-                  [30., 255., 0., 0.],
-                  [36.66666667, 255., 0., 255.],
-                  [43.33333333, 255., 255., 255.]])
+color_scales = {
+    't': np.array([
+        [-23.33333333, 255., 180., 255.],
+        [-16.66666667, 255., 0., 255.],
+        [-10., 180., 0., 255.],
+        [-5.33333333, 100., 0., 255.],
+        [0., 0., 0., 255.],
+        [4.66666667, 0., 255., 255.],
+        [10., 255., 255., 255.],
+        [16.66666667, 255., 255., 0.],
+        [23.33333333, 255., 180., 0.],
+        [30., 255., 0., 0.],
+        [36.66666667, 255., 0., 255.],
+        [43.33333333, 255., 255., 255.]
+    ]),
+    'sde': np.array([
+        [0, 0, 0, 0],
+        [0.3, 63, 161, 196],
+        [0.75, 0, 0, 255],
+        [1.25, 130, 0, 255],
+        [2, 255, 0, 255],
+        [3, 255, 255, 255]
+    ])
+}
 
 img_cache = defaultdict(BytesIO)
 
@@ -118,7 +131,7 @@ def interpolate_weather_data(param, time, coords):
             if data['longitude'] > lowerLng and data['longitude'] < upperLng and data['latitude'] > lowerLat and data['latitude'] < upperLat:
                 x = int((float(data['longitude']) - lowerLng) * (width / (upperLng - lowerLng)))
                 y = int((upperLat - float(data['latitude'])) * (height / (upperLat - lowerLat)))
-                arr[y][x] = float(data['t'])
+                arr[y][x] = float(data[param])
         
         print(np.sum(np.isnan(arr)))
         arr = interpolate(arr)
@@ -128,10 +141,10 @@ def interpolate_weather_data(param, time, coords):
         image = Image.new('RGB', (width, height))
 
         pixel_values = arr.flatten()
-        color_scale_values = color_scale[:, 0]
-        color_scale_rgb = color_scale[:, 1:]
+        color_scale_values = color_scales[param][:, 0]
+        color_scale_rgb = color_scales[param][:, 1:]
 
-        indices = np.interp(pixel_values, color_scale_values, np.arange(len(color_scale)))
+        indices = np.interp(pixel_values, color_scale_values, np.arange(len(color_scales[param])))
 
         for y in range(height):
             for x in range(width):
@@ -183,24 +196,46 @@ def interpolate_weather_data(param, time, coords):
                 # Read the image data within the window
                 cropped_data = dataset.read(window=new_window)
 
-                print(cropped_data.shape)
+                output_height = 400
+                output_width = 700
 
-                # Create a new rasterio dataset for the cropped image
-                cropped_profile = dataset.profile.copy()
+                # Create an empty array for the interpolated data
+                interpolated_data = np.empty((cropped_data.shape[0], output_height, output_width), dtype=cropped_data.dtype)
 
-                # Write the cropped data to the dataset
-                with MemoryFile() as cropped_memfile:
-                    with cropped_memfile.open(**cropped_profile) as cropped_dataset:
-                        cropped_dataset.write(cropped_data)
+                # Define the output transform
+                output_transform = dataset.transform * dataset.transform.scale(
+                    (new_width * original_size[1] / original_width) / output_width,
+                    (new_height * original_size[0] / original_height) / output_height
+                )
 
-                    # Save the cropped image to a BytesIO object
-                    cropped_img_stream = BytesIO(cropped_memfile.read())
+                # Perform bilinear interpolation using rasterio
+                reproject(
+                    cropped_data,
+                    interpolated_data,
+                    src_transform=dataset.transform,
+                    src_crs=CRS.from_epsg(4326),
+                    dst_transform=output_transform,
+                    dst_crs=CRS.from_epsg(4326),
+                    resampling=Resampling.cubic
+                )
 
-                # Update the cache with the cropped image
+                # Create a new rasterio dataset for the interpolated image
+                interpolated_profile = dataset.profile.copy()
+                interpolated_profile.update(width=output_width, height=output_height, transform=output_transform)
+
+                # Write the interpolated data to the dataset
+                with MemoryFile() as interpolated_memfile:
+                    with interpolated_memfile.open(**interpolated_profile) as interpolated_dataset:
+                        interpolated_dataset.write(interpolated_data)
+
+                    # Save the interpolated image to a BytesIO object
+                    interpolated_img_stream = BytesIO(interpolated_memfile.read())
+
+                # Update the cache with the interpolated image
                 img_stream_copy = BytesIO(img_stream.getvalue())
                 img_cache[f'{param}_{time}'] = img_stream_copy
 
-                return send_file(cropped_img_stream, mimetype='image/png')
+                return send_file(interpolated_img_stream, mimetype='image/png')
             
 
 def interpolate(array):
@@ -208,7 +243,7 @@ def interpolate(array):
     points = np.column_stack((x.flatten(), y.flatten()))
     values = array.flatten()
     valid_indices = ~np.isnan(values)
-    filled_values = griddata(points[valid_indices], values[valid_indices], (x, y), method='linear')
+    filled_values = griddata(points[valid_indices], values[valid_indices], (x, y), method='cubic')
     return filled_values
 
 if __name__ == '__main__':
