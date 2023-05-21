@@ -9,6 +9,7 @@ import rasterio as rio
 from scipy.interpolate import griddata
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
+from collections import defaultdict
 import time as t
 
 app = Flask(__name__)
@@ -85,6 +86,8 @@ color_scale = np.array([[-23.33333333, 255., 180., 255.],
                   [36.66666667, 255., 0., 255.],
                   [43.33333333, 255., 255., 255.]])
 
+cache = defaultdict(list)
+
 @app.route('/weather/<param>/<time>/<coords>')
 def interpolate_weather_data(param, time, coords):
     cursor = connection.cursor(dictionary=True)
@@ -95,16 +98,16 @@ def interpolate_weather_data(param, time, coords):
     query = f"""
         SELECT latitude, longitude, {param}
         FROM weather
-        WHERE latitude > {lowerLat}
-            AND latitude < {upperLat}
-            AND longitude > {lowerLng}
-            AND longitude < {upperLng}
-            AND time_start = {time};
+        WHERE time_start = {time};
     """
+
     start_time = t.time()
-    cursor.execute(query)
-    results = cursor.fetchall()
-    data = results
+    if not f'{param}_{time}' in cache:
+        cursor.execute(query)
+        data = cursor.fetchall()
+        cache[f'{param}_{time}'] = data
+    else:
+        data = cache[f'{param}_{time}']
     end_time = t.time()
     execution_time = end_time - start_time
 
@@ -115,12 +118,15 @@ def interpolate_weather_data(param, time, coords):
     arr = np.full((height, width), np.nan)
 
     for data in data:
-        x = int((float(data['longitude']) - lowerLng) * (width / (upperLng - lowerLng)))
-        y = int((upperLat - float(data['latitude'])) * (height / (upperLat - lowerLat)))
-        arr[y][x] = float(data['t'])
+        if data['longitude'] > lowerLng and data['longitude'] < upperLng and data['latitude'] > lowerLat and data['latitude'] < upperLat:
+            x = int((float(data['longitude']) - lowerLng) * (width / (upperLng - lowerLng)))
+            y = int((upperLat - float(data['latitude'])) * (height / (upperLat - lowerLat)))
+            arr[y][x] = float(data['t'])
     
     start_time = t.time()
+    print(np.sum(np.isnan(arr)))
     arr = interpolate(arr)
+    print(np.sum(np.isnan(arr)))
     end_time = t.time()
     execution_time = end_time - start_time
 
@@ -131,9 +137,12 @@ def interpolate_weather_data(param, time, coords):
 
     start_time = t.time()
 
+    # Assign variables outside the loop
     pixel_values = arr.flatten()
     color_scale_values = color_scale[:, 0]
     color_scale_rgb = color_scale[:, 1:]
+
+    # Create index array outside the loop
     indices = np.interp(pixel_values, color_scale_values, np.arange(len(color_scale)))
 
     for y in range(height):
@@ -151,7 +160,6 @@ def interpolate_weather_data(param, time, coords):
                 image.putpixel((x, y), (r, g, b))
             else:
                 image.putpixel((x, y), (0, 0, 0))
-                
     end_time = t.time()
     execution_time = end_time - start_time
 
