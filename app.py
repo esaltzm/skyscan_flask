@@ -5,12 +5,17 @@ from io import BytesIO
 import mysql.connector
 from flask_cors import CORS
 import numpy as np
-import rasterio as rio
+import rasterio
+from rasterio.crs import CRS
+from rasterio.enums import Resampling
+from rasterio.transform import from_bounds
+from rasterio.windows import Window
+from rasterio.warp import calculate_default_transform
+from rasterio.io import MemoryFile
 from scipy.interpolate import griddata
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 from collections import defaultdict
-import time as t
 import copy
 
 app = Flask(__name__)
@@ -87,7 +92,6 @@ color_scale = np.array([[-23.33333333, 255., 180., 255.],
                   [36.66666667, 255., 0., 255.],
                   [43.33333333, 255., 255., 255.]])
 
-cache = defaultdict(list)
 img_cache = defaultdict(BytesIO)
 
 @app.route('/weather/<param>/<time>/<coords>')
@@ -103,7 +107,6 @@ def interpolate_weather_data(param, time, coords):
         WHERE time_start = {time};
     """
 
-    start_time = t.time()
     if not f'{param}_{time}' in img_cache:
         cursor.execute(query)
         data = cursor.fetchall()
@@ -117,26 +120,17 @@ def interpolate_weather_data(param, time, coords):
                 y = int((upperLat - float(data['latitude'])) * (height / (upperLat - lowerLat)))
                 arr[y][x] = float(data['t'])
         
-        start_time = t.time()
         print(np.sum(np.isnan(arr)))
         arr = interpolate(arr)
         print(np.sum(np.isnan(arr)))
-        end_time = t.time()
-        execution_time = end_time - start_time
-
-        print(f"time to interpolate: {execution_time} seconds")
 
         height, width = arr.shape
         image = Image.new('RGB', (width, height))
 
-        start_time = t.time()
-
-        # Assign variables outside the loop
         pixel_values = arr.flatten()
         color_scale_values = color_scale[:, 0]
         color_scale_rgb = color_scale[:, 1:]
 
-        # Create index array outside the loop
         indices = np.interp(pixel_values, color_scale_values, np.arange(len(color_scale)))
 
         for y in range(height):
@@ -154,10 +148,6 @@ def interpolate_weather_data(param, time, coords):
                     image.putpixel((x, y), (r, g, b))
                 else:
                     image.putpixel((x, y), (0, 0, 0))
-        end_time = t.time()
-        execution_time = end_time - start_time
-
-        print(f"time to color png: {execution_time} seconds")
 
         img_stream = BytesIO()
         image.save(img_stream, format='PNG')
@@ -166,10 +156,52 @@ def interpolate_weather_data(param, time, coords):
         img_cache[f'{param}_{time}'] = img_stream_copy
         img_stream.seek(0)
         return send_file(img_stream, mimetype='image/png')
+    
     else:
-        img_stream = copy.copy(img_cache[f'{param}_{time}'])
+        img_stream = img_cache[f'{param}_{time}']
         img_stream.seek(0)
-        return send_file(img_stream, mimetype='image/png')
+
+        with MemoryFile(img_stream) as memfile:
+            with memfile.open() as dataset:
+                original_bounds = [[24.396308, -125.000000], [49.384358, -66.934570]]
+                original_size = (400, 700)
+
+                # Define the new bounds
+                bounds = (lowerLng, lowerLat, upperLng, upperLat)  # Update with your desired bounds
+
+                # Calculate the offsets for the window
+                original_width = original_bounds[1][1] - original_bounds[0][1]
+                original_height = original_bounds[1][0] - original_bounds[0][0]
+                new_width = upperLng - lowerLng
+                new_height = upperLat - lowerLat
+                x_offset = int((bounds[0] - original_bounds[0][1]) * original_size[1] / original_width)
+                y_offset = int((original_bounds[1][0] - bounds[3]) * original_size[0] / original_height)
+
+                # Calculate the window for cropping
+                new_window = Window(x_offset, y_offset, int(new_width * original_size[1] / original_width), int(new_height * original_size[0] / original_height))
+
+                # Read the image data within the window
+                cropped_data = dataset.read(window=new_window)
+
+                print(cropped_data.shape)
+
+                # Create a new rasterio dataset for the cropped image
+                cropped_profile = dataset.profile.copy()
+
+                # Write the cropped data to the dataset
+                with MemoryFile() as cropped_memfile:
+                    with cropped_memfile.open(**cropped_profile) as cropped_dataset:
+                        cropped_dataset.write(cropped_data)
+
+                    # Save the cropped image to a BytesIO object
+                    cropped_img_stream = BytesIO(cropped_memfile.read())
+
+                # Update the cache with the cropped image
+                img_stream_copy = BytesIO(img_stream.getvalue())
+                img_cache[f'{param}_{time}'] = img_stream_copy
+
+                return send_file(cropped_img_stream, mimetype='image/png')
+            
 
 def interpolate(array):
     x, y = np.meshgrid(np.arange(array.shape[1]), np.arange(array.shape[0]))
