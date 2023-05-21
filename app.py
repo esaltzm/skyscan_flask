@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from PIL import Image
 from collections import defaultdict
 import time as t
+import copy
 
 app = Flask(__name__)
 CORS(app)
@@ -87,6 +88,7 @@ color_scale = np.array([[-23.33333333, 255., 180., 255.],
                   [43.33333333, 255., 255., 255.]])
 
 cache = defaultdict(list)
+img_cache = defaultdict(BytesIO)
 
 @app.route('/weather/<param>/<time>/<coords>')
 def interpolate_weather_data(param, time, coords):
@@ -102,73 +104,72 @@ def interpolate_weather_data(param, time, coords):
     """
 
     start_time = t.time()
-    if not f'{param}_{time}' in cache:
+    if not f'{param}_{time}' in img_cache:
         cursor.execute(query)
         data = cursor.fetchall()
-        cache[f'{param}_{time}'] = data
+        width = 700  # Width of the 2D array
+        height = 400  # Height of the 2D array
+        arr = np.full((height, width), np.nan)
+
+        for data in data:
+            if data['longitude'] > lowerLng and data['longitude'] < upperLng and data['latitude'] > lowerLat and data['latitude'] < upperLat:
+                x = int((float(data['longitude']) - lowerLng) * (width / (upperLng - lowerLng)))
+                y = int((upperLat - float(data['latitude'])) * (height / (upperLat - lowerLat)))
+                arr[y][x] = float(data['t'])
+        
+        start_time = t.time()
+        print(np.sum(np.isnan(arr)))
+        arr = interpolate(arr)
+        print(np.sum(np.isnan(arr)))
+        end_time = t.time()
+        execution_time = end_time - start_time
+
+        print(f"time to interpolate: {execution_time} seconds")
+
+        height, width = arr.shape
+        image = Image.new('RGB', (width, height))
+
+        start_time = t.time()
+
+        # Assign variables outside the loop
+        pixel_values = arr.flatten()
+        color_scale_values = color_scale[:, 0]
+        color_scale_rgb = color_scale[:, 1:]
+
+        # Create index array outside the loop
+        indices = np.interp(pixel_values, color_scale_values, np.arange(len(color_scale)))
+
+        for y in range(height):
+            for x in range(width):
+                pixel_value = pixel_values[y * width + x]
+                if not np.isnan(pixel_value):
+                    index = indices[y * width + x]
+                    lower_index = int(np.floor(index))
+                    upper_index = int(np.ceil(index))
+                    lower_rgb = color_scale_rgb[lower_index]
+                    upper_rgb = color_scale_rgb[upper_index]
+                    factor = index - lower_index
+                    interpolated_rgb = (1 - factor) * lower_rgb + factor * upper_rgb
+                    r, g, b = tuple(interpolated_rgb.astype(int))
+                    image.putpixel((x, y), (r, g, b))
+                else:
+                    image.putpixel((x, y), (0, 0, 0))
+        end_time = t.time()
+        execution_time = end_time - start_time
+
+        print(f"time to color png: {execution_time} seconds")
+
+        img_stream = BytesIO()
+        image.save(img_stream, format='PNG')
+        img_stream_copy = BytesIO(img_stream.getvalue())
+
+        img_cache[f'{param}_{time}'] = img_stream_copy
+        img_stream.seek(0)
+        return send_file(img_stream, mimetype='image/png')
     else:
-        data = cache[f'{param}_{time}']
-    end_time = t.time()
-    execution_time = end_time - start_time
-
-    print(f"time to fetch data: {execution_time} seconds")
-
-    width = 700  # Width of the 2D array
-    height = 400  # Height of the 2D array
-    arr = np.full((height, width), np.nan)
-
-    for data in data:
-        if data['longitude'] > lowerLng and data['longitude'] < upperLng and data['latitude'] > lowerLat and data['latitude'] < upperLat:
-            x = int((float(data['longitude']) - lowerLng) * (width / (upperLng - lowerLng)))
-            y = int((upperLat - float(data['latitude'])) * (height / (upperLat - lowerLat)))
-            arr[y][x] = float(data['t'])
-    
-    start_time = t.time()
-    print(np.sum(np.isnan(arr)))
-    arr = interpolate(arr)
-    print(np.sum(np.isnan(arr)))
-    end_time = t.time()
-    execution_time = end_time - start_time
-
-    print(f"time to interpolate: {execution_time} seconds")
-
-    height, width = arr.shape
-    image = Image.new('RGB', (width, height))
-
-    start_time = t.time()
-
-    # Assign variables outside the loop
-    pixel_values = arr.flatten()
-    color_scale_values = color_scale[:, 0]
-    color_scale_rgb = color_scale[:, 1:]
-
-    # Create index array outside the loop
-    indices = np.interp(pixel_values, color_scale_values, np.arange(len(color_scale)))
-
-    for y in range(height):
-        for x in range(width):
-            pixel_value = pixel_values[y * width + x]
-            if not np.isnan(pixel_value):
-                index = indices[y * width + x]
-                lower_index = int(np.floor(index))
-                upper_index = int(np.ceil(index))
-                lower_rgb = color_scale_rgb[lower_index]
-                upper_rgb = color_scale_rgb[upper_index]
-                factor = index - lower_index
-                interpolated_rgb = (1 - factor) * lower_rgb + factor * upper_rgb
-                r, g, b = tuple(interpolated_rgb.astype(int))
-                image.putpixel((x, y), (r, g, b))
-            else:
-                image.putpixel((x, y), (0, 0, 0))
-    end_time = t.time()
-    execution_time = end_time - start_time
-
-    print(f"time to color png: {execution_time} seconds")
-
-    img_stream = BytesIO()
-    image.save(img_stream, format='PNG')
-    img_stream.seek(0)
-    return send_file(img_stream, mimetype='image/png')
+        img_stream = copy.copy(img_cache[f'{param}_{time}'])
+        img_stream.seek(0)
+        return send_file(img_stream, mimetype='image/png')
 
 def interpolate(array):
     x, y = np.meshgrid(np.arange(array.shape[1]), np.arange(array.shape[0]))
